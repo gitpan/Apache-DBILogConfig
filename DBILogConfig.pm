@@ -11,28 +11,37 @@ use Apache::Constants qw( :common );
 use DBI;
 use Date::Format;
 
-$Apache::DBILogConfig::VERSION = "0.01";
+$Apache::DBILogConfig::VERSION = "0.02";
 
 # List of allowed formats and their values
 my %Formats = 
-  ('b' => sub {my $r = shift; return $r->bytes_sent}, # Bytes sent
-   'f' => sub {my $r = shift; return $r->filename}, # Filename
-   'e' => sub {my $r = shift; return $r->subprocess_env(shift)}, # Any environment variable
-   'h' => sub {my $r = shift; return $r->get_remote_host}, # Remote host
-   'a' => sub {my $r = shift; return $r->connection->remote_ip}, # Remote IP Address
-   'i' => sub {my $r = shift; return $r->header_in(shift)}, # A header in the client request
-   'l' => sub {my $r = shift; return $r->get_remote_logname}, # Remote log name (from identd)
-   'n' => sub {my $r = shift; return $r->notes(shift)}, # The contents of a note from another module
-   'o' => sub {my $r = shift; return $r->header_out(shift)}, # A header from the reply
-   'p' => sub {my $r = shift; return $r->get_server_port}, # Server port
+  (
+	 'a' => sub {return (shift)->connection->remote_ip}, # Remote IP Address
+	 'A' => sub {}, # Local IP-address
+	 'b' => sub {return (shift)->bytes_sent || '-'}, # Bytes sent, excluding heaers, in CLF format
+	 'B' => sub {return (shift)->bytes_sent}, # Bytes sent, excluding heaers
+	 'c' => sub {}, # Connection status when response is completed (X, +, -)
+   'e' => sub {return (shift)->subprocess_env(shift)}, # Any environment variable
+   'f' => sub {return (shift)->filename}, # Filename
+   'h' => sub {return (shift)->get_remote_host}, # Remote host
+   'H' => sub {return (shift)->protocol}, # The request protocol
+   'i' => sub {return (shift)->header_in(shift)}, # A header in the client request
+   'l' => sub {return (shift)->get_remote_logname}, # Remote log name (from identd)
+   'm' => sub {return (shift)->method}, # The request method
+   'n' => sub {return (shift)->notes(shift)}, # The contents of a note from another module
+   'o' => sub {return (shift)->header_out(shift)}, # A header from the reply
+   'p' => sub {return (shift)->get_server_port}, # Server port
    'P' => sub {return $$}, # Apache child PID
-   'r' => sub {my $r = shift; return $r->the_request}, # First line of the request
-   's' => sub {my $r = shift; return $r->status}, # Status
-   't' => sub {my $r = shift; my $format = shift || "%d/%b/%Y:%X %z"; return time2str $format, time}, # Time: CLF or strftime
-   'T' => sub {my $r = shift; return (time - $r->request_time)}, # Time take to serve requests
-   'u' => sub {my $r = shift; return $r->connection->user}, # Remote user from auth
-   'U' => sub {my $r = shift; return $r->uri}, # URL
-   'v' => sub {my $r = shift; return $r->server->server_hostname} # Server hostname
+	 'q' => sub {return $_[0]->args ? '?' . $_[0]->args : ''}, # The query string (prepended with a ?
+	                                                             # if the query exists)
+   'r' => sub {return (shift)->the_request}, # First line of the request
+   's' => sub {return (shift)->status}, # Status
+   't' => sub {return time2str $_[1] || "%d/%b/%Y:%X %z", $_[0]->request_time}, # Time: CLF or strftime
+   'T' => sub {return time - (shift)->request_time}, # Time taken to serve the request
+   'u' => sub {return (shift)->connection->user}, # Remote user from auth
+   'U' => sub {return (shift)->uri}, # URL
+   'v' => sub {return (shift)->server->server_hostname}, # The canonical ServerName
+   'V' => sub {} # The UseCanonicalName server name
   );
 
 # SUBS
@@ -56,17 +65,19 @@ sub logger {
 
   # Parse the formats ( %[conditions]{param}format=field [...] )
   my @format_list = (); # List of anon hashes {field, format, param, conditions}
-  foreach my $format_string (split /\s+/, Apache->request->dir_config('DBILogConfig_log_format')) {
-    my ($format) = ($format_string =~ /(\w)=/);
-    my ($field) = ($format_string =~ /=([-\w]+)$/);
-    my ($param) = ($format_string =~ /\{([^\}]+)\}/);
-    my ($op, $conditions_string) = ($format_string =~ /^%(!?)((?:\d{3},*)+)/);
-    my @conditions = map q($r->status ==  ) . $_, split /,/, $conditions_string; # Or conditions together
-    my $conditions = join(' or ', @conditions); 
-    $conditions = qq{!($conditions)} if $op; # Negate if necessary 
+	my $format_string = Apache->request->dir_config('DBILogConfig_log_format');
+	while ($format_string =~ /%(!)?([^\{[:alpha:]]*)(?:\{([^\}]+)\})?(\w)=(\S+)/g) {
+		my ($op, $conditions, $param, $format, $field) = ($1, $2, $3, $4, $5);
+
+		# Or conditions together
+    my @conditions = map q($r->status ==  ) . $_, split /,/, $conditions;
+    $conditions = join(' or ', @conditions);
+
+    $conditions = qq{!($conditions)} if $op eq '!'; # Negate if necessary
     $conditions ||= 1; # If no conditions we want a guranteed true condition
     $r->warn("DBILogConfig: format=$format, field=$field, param=$param, conditions=$conditions");
-    push @format_list, {'field' => $field, 'format' => $format, 'param' => $param, 'conditions' => $conditions};
+    push @format_list, {'field' => $field, 'format' => $format, 'param' => $param, 
+												'conditions' => $conditions};
   } # End foreach
 
   # Create the statement and insert data
@@ -77,10 +88,10 @@ sub logger {
   my $statement = qq(INSERT INTO $table ($fields) VALUES ($values));
   $r->warn("DBILogConfig: statement=$statement");
   $dbh->do($statement);
-  
+
   $dbh->disconnect;
-  
-  return OK; 
+
+  return OK;
 
 } # End logger
 
@@ -107,7 +118,8 @@ Apache::DBILogConfig - Logs access information in a DBI database
 =head1 DESCRIPTION
 
 This module replicates the functionality of the standard Apache module, mod_log_config,
-but logs information in a DBI-compliant database instead of a file.
+but logs information in a DBI-compliant database instead of a file. (Some documentation has been
+borrowed from the mod_log_config documentation.)
 
 =head1 LIST OF TOKENS
 
@@ -131,13 +143,13 @@ Table in the database for logging
 
 =item DBILogConfig_log_format
 
-A string consisting of formats seperated by white space that define the data to be looged (see FORMATS below)
+A string consisting of formats separated by white space that define the data to be logged (see FORMAT STRING below)
 
 =back
 
-=head1 FORMATS
+=head1 FORMAT STRING
 
-A format consists of a string with the following syntax: 
+A format string consists of a string with the following syntax:
 
 B<%[conditions][{parameter}]format=field>
 
@@ -147,41 +159,62 @@ Formats specify the type of data to be logged. The following formats are accepte
 
 =over
 
-=item b Bytes sent
+=item a Remote IP-address
+
+=item A Local IP-address (not yet supported)
+
+=item B Bytes sent, excluding HTTP headers.
+
+=item b Bytes sent, excluding HTTP headers. In CLF format
+        i.e. a '-' rather than a 0 when no bytes are sent.
+
+=item c Connection status when response is completed.
+        'X' = connection aborted before the response completed.
+        '+' = connection may be kept alive after the response is sent.
+        '-' = connection will be closed after the response is sent.
+        (not yet supported)
+
+=item e The contents of the environment variable specified by parameter
 
 =item f Filename
 
-=item e Environment variable (specified by parameter)
-
 =item h Remote host
 
-=item a Remote IP Address
+=item H The request protocol
 
-=item i Header in the client request (specified by parameter)
+=item i The contents of the header (specified by parameter) in the request sent to the server.
 
-=item l Remote log name (from identd)
+=item l Remote logname (from identd, if supplied)
 
-=item n Contents of a note from another module (specified by parameter)
+=item m The request method
 
-=item o Header from the reply (specified by parameter)
+=item n The contents of note (specified by parameter) from another module.
 
-=item p Server port
+=item o The contents of the header (specified by parameter) in the reply.
 
-=item P Apache child PID
+=item p The canonical Port of the server serving the request
 
-=item r First line of the request
+=item P The process ID of the child that serviced the request.
 
-=item s Request status
+=item q The query string (prepended with a ? if a query string exists, otherwise an empty string)
 
-=item t Time in common log format (default) or strftime() (parameter)
+=item r First line of request
 
-=item T Time taken to serve request
+=item s Status. For requests that got internally redirected, this is the status of
+        the *original* request.
 
-=item u Remote user from auth
+=item t Time, in common log format time format or the format specified by parameter, 
+        which should be in strftime(3) format.
 
-=item U URL
+=item T The time taken to serve the request, in seconds.
 
-=item v Server hostname
+=item u Remote user (from auth; may be bogus if return status (%s) is 401)
+
+=item U The URL path requested.
+
+=item v The canonical ServerName of the server serving the request.
+
+=item V The server name according to the UseCanonicalName setting (not yet supported).
 
 =back
 
@@ -197,7 +230,7 @@ Example: %{DOCUMENT_ROOT}e
 
 =head2 conditions
 
-Conditions are a comma-seperated list of status codes. If the status of the request being logged equals one of 
+Conditions are a comma-separated list of status codes. If the status of the request being logged equals one of 
 the status codes in the condition the data specified by the format will be logged. By placing a '!' in front of
 the conditions, data will be logged if the request status does not match any of the conditions.
 
@@ -233,9 +266,15 @@ This will install the module into the Perl library directory.
 
 Once installed, you will need to modify your web server's configuration as above.
 
+=head1 NOTE
+
+After installing and configuring this module, Apache will continue to log to your regular
+access log file (if it was previously configured that way). To log accesses only to your database
+comment out CustomLog or TransferLog or set them to /dev/null.
+
 =head1 AUTHOR
 
-Copyright (C) 1998, Jason Bodnar <jcbodnar@mail.utexas.edu>. All rights reserved.
+Copyright (C) 1998, Jason Bodnar <jason@shakabuku.org>. All rights reserved.
 
 This module is free software; you may redistribute it and/or
 modify it under the same terms as Perl itself.
